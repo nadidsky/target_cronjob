@@ -1,0 +1,8 @@
+{
+  "job_command":    "/usr/local/bin/my_report_job",
+  "trigger_hour":   19,
+  "trigger_minute": 30,
+  "anchor_date":    "2025-01-01",
+  "run_dir":        "/var/lib/target_job",
+  "max_log_bytes":  10485760
+}
