@@ -1,6 +1,6 @@
 // target_job.go — TARGET Closing Days Report Runner
 //
-// A POSIX sh cron script (every minute) that, after 19:30 on TARGET open days,
+// A cron job (every minute) that, after a configurable time on TARGET open days,
 // runs a report job covering all calendar dates since the last successful run —
 // automatically backfilling weekends, holidays, and failed days.
 // Silent on most ticks; single-instance locked; retries until success is recorded.
@@ -10,8 +10,12 @@
 //
 // Install:
 //   sudo cp target_job /usr/local/bin/target_job
-//   sudo mkdir -p /var/lib/target_job
+//   sudo mkdir -p /etc/target_job /var/lib/target_job
+//   sudo cp config.json /etc/target_job/config.json   # edit before copying
 //   crontab -e  →  add:  * * * * * /usr/local/bin/target_job
+//
+// Override config path:
+//   /usr/local/bin/target_job -config /path/to/my_config.json
 //
 // No external dependencies — standard library only.
 
@@ -19,6 +23,8 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -32,39 +38,100 @@ import (
 )
 
 // =============================================================================
-// CONFIGURATION — edit these values before building
+// CONFIGURATION
 // =============================================================================
 
-const (
-	// jobCommand is the executable to run. It receives dates as arguments,
-	// oldest first: jobCommand 2025-04-18 2025-04-19 ... 2025-04-22
-	jobCommand = "/usr/local/bin/my_report_job"
+const defaultConfigPath = "/etc/target_job/config.json"
 
-	// triggerHour and triggerMinute define the earliest time the job may run
-	// each day (24h format). Before this time every cron tick is a silent exit.
-	triggerHour   = 19
-	triggerMinute = 30
+// Config holds all runtime settings loaded from the JSON config file.
+// Edit the config file and restart — no recompilation needed.
+type Config struct {
+	// JobCommand is the executable to run. It receives dates as arguments
+	// (oldest first): e.g. my_report_job 2025-04-18 2025-04-19 2025-04-22
+	JobCommand string `json:"job_command"`
 
-	// anchorDate (YYYY-MM-DD) is the earliest date ever included in a run.
+	// TriggerHour and TriggerMinute define the earliest time the job may
+	// run each day (24h format). Every cron tick before this is a silent exit.
+	TriggerHour   int `json:"trigger_hour"`
+	TriggerMinute int `json:"trigger_minute"`
+
+	// AnchorDate (YYYY-MM-DD) is the earliest date ever included in a run.
 	// On the first ever execution (empty state file) the date range starts here.
-	anchorDate = "2025-01-01"
+	AnchorDate string `json:"anchor_date"`
 
-	// runDir holds the lock directory, state file, and log file.
-	runDir = "/var/lib/target_job"
+	// RunDir holds all runtime files: lock directory, state file, log file.
+	RunDir string `json:"run_dir"`
 
-	// maxLogBytes is the log file size threshold for rotation (default: 10 MB).
-	maxLogBytes = 10 * 1024 * 1024
-)
+	// MaxLogBytes is the log file size threshold for rotation. Default: 10 MB.
+	MaxLogBytes int64 `json:"max_log_bytes"`
+}
+
+// defaults returns a Config with safe fallback values.
+// Any field present in the JSON file overrides the corresponding default.
+func defaults() Config {
+	return Config{
+		JobCommand:    "/usr/local/bin/my_report_job",
+		TriggerHour:   19,
+		TriggerMinute: 30,
+		AnchorDate:    "2025-01-01",
+		RunDir:        "/var/lib/target_job",
+		MaxLogBytes:   10 * 1024 * 1024,
+	}
+}
+
+// loadConfig reads and parses the JSON config file at path.
+// Missing fields keep their default values.
+func loadConfig(path string) (Config, error) {
+	cfg := defaults()
+
+	f, err := os.Open(path)
+	if err != nil {
+		return cfg, fmt.Errorf("cannot open config file %s: %w", path, err)
+	}
+	defer f.Close()
+
+	dec := json.NewDecoder(f)
+	dec.DisallowUnknownFields() // catch typos in the config file
+	if err := dec.Decode(&cfg); err != nil {
+		return cfg, fmt.Errorf("cannot parse config file %s: %w", path, err)
+	}
+
+	if err := validateConfig(cfg); err != nil {
+		return cfg, fmt.Errorf("invalid config: %w", err)
+	}
+	return cfg, nil
+}
+
+// validateConfig checks that all required fields are sensible.
+func validateConfig(cfg Config) error {
+	if cfg.JobCommand == "" {
+		return fmt.Errorf("job_command must not be empty")
+	}
+	if cfg.TriggerHour < 0 || cfg.TriggerHour > 23 {
+		return fmt.Errorf("trigger_hour must be 0–23, got %d", cfg.TriggerHour)
+	}
+	if cfg.TriggerMinute < 0 || cfg.TriggerMinute > 59 {
+		return fmt.Errorf("trigger_minute must be 0–59, got %d", cfg.TriggerMinute)
+	}
+	if _, err := time.Parse("2006-01-02", cfg.AnchorDate); err != nil {
+		return fmt.Errorf("anchor_date must be YYYY-MM-DD, got %q", cfg.AnchorDate)
+	}
+	if cfg.RunDir == "" {
+		return fmt.Errorf("run_dir must not be empty")
+	}
+	if cfg.MaxLogBytes <= 0 {
+		return fmt.Errorf("max_log_bytes must be positive, got %d", cfg.MaxLogBytes)
+	}
+	return nil
+}
 
 // =============================================================================
-// RUNTIME PATHS — derived from runDir
+// RUNTIME PATHS — derived from cfg.RunDir
 // =============================================================================
 
-var (
-	lockDir   = filepath.Join(runDir, "target_job.lock")
-	stateFile = filepath.Join(runDir, "target_job_success.log")
-	logFile   = filepath.Join(runDir, "target_job.log")
-)
+func lockDir(cfg Config) string   { return filepath.Join(cfg.RunDir, "target_job.lock") }
+func stateFile(cfg Config) string { return filepath.Join(cfg.RunDir, "target_job_success.log") }
+func logFile(cfg Config) string   { return filepath.Join(cfg.RunDir, "target_job.log") }
 
 // =============================================================================
 // LOGGING
@@ -75,25 +142,24 @@ var (
 // zero log output, keeping the log clean despite the every-minute cron.
 var appLog *log.Logger
 
-// initLogging opens the log file (rotating if over maxLogBytes), then
-// creates a logger that writes to both the file and stdout.
-func initLogging() error {
-	if err := os.MkdirAll(runDir, 0755); err != nil {
-		return fmt.Errorf("cannot create runDir %s: %w", runDir, err)
+// initLogging opens the log file (rotating if over MaxLogBytes) and creates
+// a logger that writes to both the file and stdout.
+func initLogging(cfg Config) error {
+	if err := os.MkdirAll(cfg.RunDir, 0755); err != nil {
+		return fmt.Errorf("cannot create run_dir %s: %w", cfg.RunDir, err)
 	}
 
-	// Rotate if the log file has grown too large
-	if info, err := os.Stat(logFile); err == nil && info.Size() > maxLogBytes {
-		_ = os.Rename(logFile, logFile+".1")
+	lf := logFile(cfg)
+	if info, err := os.Stat(lf); err == nil && info.Size() > cfg.MaxLogBytes {
+		_ = os.Rename(lf, lf+".1")
 	}
 
-	f, err := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	f, err := os.OpenFile(lf, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
-		return fmt.Errorf("cannot open log file %s: %w", logFile, err)
+		return fmt.Errorf("cannot open log file %s: %w", lf, err)
 	}
 
-	mw := io.MultiWriter(os.Stdout, f)
-	appLog = log.New(mw, "", log.LstdFlags)
+	appLog = log.New(io.MultiWriter(os.Stdout, f), "", log.LstdFlags)
 	return nil
 }
 
@@ -107,21 +173,23 @@ func logf(level, format string, args ...interface{}) {
 // LOCK — single-instance guarantee via atomic directory creation
 // =============================================================================
 
-// acquireLock creates lockDir atomically. Returns true if the lock was
-// acquired, false if another instance already holds it.
-// os.Mkdir is atomic on all POSIX-compliant filesystems.
-func acquireLock() bool {
-	if err := os.Mkdir(lockDir, 0700); err != nil {
+// acquireLock creates the lock directory atomically.
+// Returns true if the lock was acquired, false if another instance holds it.
+func acquireLock(cfg Config) bool {
+	if err := os.Mkdir(lockDir(cfg), 0700); err != nil {
 		return false
 	}
-	pidFile := filepath.Join(lockDir, "pid")
-	_ = os.WriteFile(pidFile, []byte(fmt.Sprintf("%d\n", os.Getpid())), 0644)
+	_ = os.WriteFile(
+		filepath.Join(lockDir(cfg), "pid"),
+		[]byte(fmt.Sprintf("%d\n", os.Getpid())),
+		0644,
+	)
 	return true
 }
 
 // releaseLock removes the lock directory. Called via defer and signal handler.
-func releaseLock() {
-	_ = os.RemoveAll(lockDir)
+func releaseLock(cfg Config) {
+	_ = os.RemoveAll(lockDir(cfg))
 }
 
 // =============================================================================
@@ -148,7 +216,7 @@ func easterSunday(year int) time.Time {
 	return time.Date(year, time.Month(month), day, 0, 0, 0, 0, time.UTC)
 }
 
-// isTargetClosingDay returns true if d is a TARGET closing day:
+// isTargetClosingDay reports whether d is a TARGET closing day:
 //   - Saturday or Sunday
 //   - New Year's Day  (January 1)
 //   - Labour Day      (May 1)
@@ -157,15 +225,12 @@ func easterSunday(year int) time.Time {
 //   - Good Friday     (Easter Sunday − 2 days)
 //   - Easter Monday   (Easter Sunday + 1 day)
 func isTargetClosingDay(d time.Time) bool {
-	// Normalise to midnight UTC so date comparisons are clean
 	d = time.Date(d.Year(), d.Month(), d.Day(), 0, 0, 0, 0, time.UTC)
 
-	// Weekend
 	if d.Weekday() == time.Saturday || d.Weekday() == time.Sunday {
 		return true
 	}
 
-	// Fixed public holidays
 	switch {
 	case d.Month() == time.January  && d.Day() == 1,
 		 d.Month() == time.May       && d.Day() == 1,
@@ -174,41 +239,27 @@ func isTargetClosingDay(d time.Time) bool {
 		return true
 	}
 
-	// Moving holidays
 	easter := easterSunday(d.Year())
-	goodFriday  := easter.AddDate(0, 0, -2)
-	easterMonday := easter.AddDate(0, 0, 1)
-
-	return d.Equal(goodFriday) || d.Equal(easterMonday)
+	return d.Equal(easter.AddDate(0, 0, -2)) || d.Equal(easter.AddDate(0, 0, 1))
 }
 
 // =============================================================================
 // STATE — track successfully processed TARGET open days
 // =============================================================================
 
-// parseAnchor parses ANCHOR_DATE and returns it as a time.Time.
-// Panics on misconfiguration (invalid constant).
-func parseAnchor() time.Time {
-	t, err := time.Parse("2006-01-02", anchorDate)
-	if err != nil {
-		panic(fmt.Sprintf("invalid anchorDate constant %q: %v", anchorDate, err))
-	}
-	return t
-}
-
 // getLastSuccessDate reads the most recent success date from the state file.
-// Returns (anchorDate − 1 day) if the state file is absent or empty,
-// so that anchorDate itself is included on the first ever run.
-func getLastSuccessDate() time.Time {
-	floor := parseAnchor().AddDate(0, 0, -1)
+// Returns (anchorDate − 1 day) if absent or empty, so anchorDate is included
+// on the first ever run.
+func getLastSuccessDate(cfg Config) time.Time {
+	anchor, _ := time.Parse("2006-01-02", cfg.AnchorDate)
+	floor := anchor.AddDate(0, 0, -1)
 
-	f, err := os.Open(stateFile)
+	f, err := os.Open(stateFile(cfg))
 	if err != nil {
-		return floor // file absent
+		return floor
 	}
 	defer f.Close()
 
-	// Scan to the last non-empty line
 	var lastLine string
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
@@ -222,9 +273,6 @@ func getLastSuccessDate() time.Time {
 
 	// Line format: "YYYY-MM-DD  executed_at=YYYY-MM-DD HH:MM:SS"
 	parts := strings.Fields(lastLine)
-	if len(parts) == 0 {
-		return floor
-	}
 	d, err := time.Parse("2006-01-02", parts[0])
 	if err != nil {
 		return floor
@@ -232,10 +280,10 @@ func getLastSuccessDate() time.Time {
 	return d
 }
 
-// hasRunSuccessfullyToday returns true if today's date appears in the state file.
-func hasRunSuccessfullyToday(today time.Time) bool {
+// hasRunSuccessfullyToday reports whether today's date appears in the state file.
+func hasRunSuccessfullyToday(cfg Config, today time.Time) bool {
 	dateStr := today.Format("2006-01-02")
-	f, err := os.Open(stateFile)
+	f, err := os.Open(stateFile(cfg))
 	if err != nil {
 		return false
 	}
@@ -251,17 +299,16 @@ func hasRunSuccessfullyToday(today time.Time) bool {
 }
 
 // recordSuccess appends today's date with a timestamp to the state file.
-func recordSuccess(today time.Time) error {
-	f, err := os.OpenFile(stateFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+func recordSuccess(cfg Config, today time.Time) error {
+	f, err := os.OpenFile(stateFile(cfg), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		return fmt.Errorf("cannot open state file: %w", err)
 	}
 	defer f.Close()
 
-	line := fmt.Sprintf("%s  executed_at=%s\n",
+	_, err = fmt.Fprintf(f, "%s  executed_at=%s\n",
 		today.Format("2006-01-02"),
 		time.Now().Format("2006-01-02 15:04:05"))
-	_, err = f.WriteString(line)
 	return err
 }
 
@@ -271,13 +318,8 @@ func recordSuccess(today time.Time) error {
 
 // getReportDates returns every calendar date from (lastSuccess + 1 day) up to
 // and including today, in chronological order.
-//
-// This covers:
-//   - TARGET closing days (weekends, holidays) in the gap
-//   - TARGET open days that previously failed
-//   - Today itself
-func getReportDates(today time.Time) []time.Time {
-	lastSuccess := getLastSuccessDate()
+func getReportDates(cfg Config, today time.Time) []time.Time {
+	lastSuccess := getLastSuccessDate(cfg)
 	start := lastSuccess.AddDate(0, 0, 1)
 	end   := time.Date(today.Year(), today.Month(), today.Day(), 0, 0, 0, 0, time.UTC)
 
@@ -292,15 +334,14 @@ func getReportDates(today time.Time) []time.Time {
 // JOB EXECUTION
 // =============================================================================
 
-// runJob executes jobCommand with the given dates as arguments.
-// Stdout and stderr of the child process are forwarded to our own stdout/stderr.
-func runJob(dates []time.Time) error {
+// runJob executes cfg.JobCommand with the given dates as string arguments.
+// The child process inherits our stdout and stderr.
+func runJob(cfg Config, dates []time.Time) error {
 	args := make([]string, len(dates))
 	for i, d := range dates {
 		args[i] = d.Format("2006-01-02")
 	}
-
-	cmd := exec.Command(jobCommand, args...)
+	cmd := exec.Command(cfg.JobCommand, args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
@@ -311,15 +352,30 @@ func runJob(dates []time.Time) error {
 // =============================================================================
 
 func main() {
+	// ------------------------------------------------------------------
+	// Parse flags — only -config is supported
+	// ------------------------------------------------------------------
+	configPath := flag.String("config", defaultConfigPath, "path to JSON config file")
+	flag.Parse()
+
+	// ------------------------------------------------------------------
+	// Load configuration
+	// ------------------------------------------------------------------
+	cfg, err := loadConfig(*configPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "FATAL: %v\n", err)
+		os.Exit(1)
+	}
+
 	now   := time.Now()
 	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
 
 	// ------------------------------------------------------------------
-	// GATE 1 — Time check (silent exit before TRIGGER_TIME)
+	// GATE 1 — Time check (silent exit before trigger time)
 	// Most cron ticks exit here in microseconds.
 	// ------------------------------------------------------------------
-	triggerReached := now.Hour() > triggerHour ||
-		(now.Hour() == triggerHour && now.Minute() >= triggerMinute)
+	triggerReached := now.Hour() > cfg.TriggerHour ||
+		(now.Hour() == cfg.TriggerHour && now.Minute() >= cfg.TriggerMinute)
 	if !triggerReached {
 		os.Exit(0)
 	}
@@ -334,47 +390,47 @@ func main() {
 	// ------------------------------------------------------------------
 	// GATE 3 — Already succeeded today (silent exit)
 	// ------------------------------------------------------------------
-	if hasRunSuccessfullyToday(today) {
+	if hasRunSuccessfullyToday(cfg, today) {
 		os.Exit(0)
 	}
 
 	// ------------------------------------------------------------------
 	// GATE 4 — Acquire lock (silent exit if another instance is running)
 	// ------------------------------------------------------------------
-	if !acquireLock() {
+	if !acquireLock(cfg) {
 		os.Exit(0)
 	}
-	defer releaseLock()
+	defer releaseLock(cfg)
 
 	// Release lock cleanly on SIGINT / SIGTERM / SIGHUP
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 	go func() {
 		<-sigCh
-		releaseLock()
+		releaseLock(cfg)
 		os.Exit(1)
 	}()
 
 	// ------------------------------------------------------------------
 	// Initialise logging — only reached when we are actually going to run
 	// ------------------------------------------------------------------
-	if err := initLogging(); err != nil {
+	if err := initLogging(cfg); err != nil {
 		fmt.Fprintf(os.Stderr, "FATAL: %v\n", err)
 		os.Exit(1)
 	}
 
 	logf("INFO", "========== target_job started (PID %d) ==========", os.Getpid())
-	logf("INFO", "Today: %s | Trigger time reached: %s",
-		today.Format("2006-01-02"), now.Format("15:04"))
+	logf("INFO", "Config     : %s", *configPath)
+	logf("INFO", "Today      : %s | Trigger time reached: %s", today.Format("2006-01-02"), now.Format("15:04"))
+	logf("INFO", "Job command: %s", cfg.JobCommand)
 
 	// ------------------------------------------------------------------
 	// BUILD DATE RANGE
 	// ------------------------------------------------------------------
-	lastSuccess := getLastSuccessDate()
-	logf("INFO", "Last successful run : %s", lastSuccess.Format("2006-01-02"))
-	logf("INFO", "Anchor date (floor) : %s", anchorDate)
+	lastSuccess := getLastSuccessDate(cfg)
+	logf("INFO", "Last success: %s | Anchor: %s", lastSuccess.Format("2006-01-02"), cfg.AnchorDate)
 
-	dates := getReportDates(today)
+	dates := getReportDates(cfg, today)
 	logf("INFO", "Date range to process (%d day(s)):", len(dates))
 	for _, d := range dates {
 		logf("INFO", "  -> %s", d.Format("2006-01-02"))
@@ -387,20 +443,20 @@ func main() {
 	for i, d := range dates {
 		args[i] = d.Format("2006-01-02")
 	}
-	logf("INFO", "Running: %s %s", jobCommand, strings.Join(args, " "))
+	logf("INFO", "Running: %s %s", cfg.JobCommand, strings.Join(args, " "))
 
-	if err := runJob(dates); err != nil {
+	if err := runJob(cfg, dates); err != nil {
 		logf("ERROR", "Job FAILED: %v", err)
 		logf("ERROR", "Will retry on next cron trigger (every minute after %02d:%02d).",
-			triggerHour, triggerMinute)
+			cfg.TriggerHour, cfg.TriggerMinute)
 		os.Exit(1)
 	}
 
 	logf("INFO", "Job completed successfully.")
-	if err := recordSuccess(today); err != nil {
+	if err := recordSuccess(cfg, today); err != nil {
 		logf("ERROR", "Could not record success: %v", err)
 		os.Exit(1)
 	}
-	logf("INFO", "Recorded success for %s → %s", today.Format("2006-01-02"), stateFile)
+	logf("INFO", "Recorded success for %s → %s", today.Format("2006-01-02"), stateFile(cfg))
 	logf("INFO", "========== target_job finished ==========")
 }

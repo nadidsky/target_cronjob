@@ -1,6 +1,6 @@
-#!/bin/sh
+#!/bin/bash
 # =============================================================================
-# target_job_sh.sh — TARGET Closing Days Report Runner  (POSIX sh version)
+# target_job_bash.sh — TARGET Closing Days Report Runner  (bash version)
 # =============================================================================
 #
 # A cron job (every minute) that, after a configurable time on TARGET open days,
@@ -8,27 +8,22 @@
 # automatically backfilling weekends, holidays, and failed days.
 # Silent on most ticks; single-instance locked; retries until success is recorded.
 #
-# COMPATIBILITY: POSIX sh (1992+) — dash, ash, ksh88/93, busybox sh,
-#   Bourne shell on Solaris 8+, HP-UX 10+, AIX 4+
-# Requires: expr, cut, awk, tail, mkdir, rm  (all POSIX standard utilities)
-# Does NOT require: bash, flock, date -d, mktemp, perl, python
+# REQUIRES: bash 3.2+, GNU coreutils (date -d), util-linux (flock)
+# For old Unix without these, use target_job_sh.sh instead.
 #
 # USAGE:
-#   target_job_sh.sh [-c /path/to/config]
+#   target_job_bash.sh [-c /path/to/config]
 #
 # CONFIG FILE (default: /etc/target_job/target_job.conf):
 #   Standard KEY="VALUE" shell file, sourced at startup.
 #   Edit the config file and wait for the next cron tick — no restart needed.
 #
 # INSTALL:
-#   sudo cp target_job_sh.sh /usr/local/bin/target_job_sh.sh
-#   sudo chmod +x /usr/local/bin/target_job_sh.sh
+#   sudo cp target_job_bash.sh /usr/local/bin/target_job_bash.sh
+#   sudo chmod +x /usr/local/bin/target_job_bash.sh
 #   sudo mkdir -p /etc/target_job /var/lib/target_job
 #   sudo cp target_job.conf /etc/target_job/target_job.conf   # then edit it
-#   crontab -e  →  add:  * * * * * /usr/local/bin/target_job_sh.sh
-#
-# On old Solaris where /bin/sh is pre-POSIX:
-#   * * * * * /usr/xpg4/bin/sh /usr/local/bin/target_job_sh.sh
+#   crontab -e  →  add:  * * * * * /usr/local/bin/target_job_bash.sh
 #
 # =============================================================================
 
@@ -40,7 +35,7 @@
 DEFAULT_CONFIG="/etc/target_job/target_job.conf"
 
 # parse_args
-# Reads -c <config_path> from command-line arguments using POSIX getopts.
+# Reads -c <config_path> from command-line arguments.
 # Sets CONFIG_FILE to the provided path or the default.
 parse_args() {
     CONFIG_FILE="$DEFAULT_CONFIG"
@@ -69,39 +64,27 @@ load_config() {
 
 # validate_config
 # Checks that all required variables are present and sensible after sourcing.
-# Uses only expr and POSIX [ ] — no bash-specific features.
 validate_config() {
-    errors=0
+    local errors=0
 
     if [ -z "$JOB_COMMAND" ]; then
-        echo "ERROR: JOB_COMMAND must not be empty" >&2;                  errors=1
+        echo "ERROR: JOB_COMMAND must not be empty" >&2;   errors=1
     fi
-
-    # Check TRIGGER_HOUR is a number in 0-23
-    if ! expr "$TRIGGER_HOUR" : '^[0-9][0-9]*$' > /dev/null 2>&1 || \
+    if ! [[ "$TRIGGER_HOUR" =~ ^[0-9]+$ ]] || \
        [ "$TRIGGER_HOUR" -lt 0 ] || [ "$TRIGGER_HOUR" -gt 23 ]; then
         echo "ERROR: TRIGGER_HOUR must be 0-23, got: '${TRIGGER_HOUR}'" >&2; errors=1
     fi
-
-    # Check TRIGGER_MINUTE is a number in 0-59
-    if ! expr "$TRIGGER_MINUTE" : '^[0-9][0-9]*$' > /dev/null 2>&1 || \
+    if ! [[ "$TRIGGER_MINUTE" =~ ^[0-9]+$ ]] || \
        [ "$TRIGGER_MINUTE" -lt 0 ] || [ "$TRIGGER_MINUTE" -gt 59 ]; then
         echo "ERROR: TRIGGER_MINUTE must be 0-59, got: '${TRIGGER_MINUTE}'" >&2; errors=1
     fi
-
-    # Check ANCHOR_DATE matches YYYY-MM-DD pattern
-    if ! expr "$ANCHOR_DATE" : '^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]$' \
-         > /dev/null 2>&1; then
+    if ! date -d "$ANCHOR_DATE" +%Y-%m-%d > /dev/null 2>&1; then
         echo "ERROR: ANCHOR_DATE must be YYYY-MM-DD, got: '${ANCHOR_DATE}'" >&2; errors=1
     fi
-
     if [ -z "$RUN_DIR" ]; then
-        echo "ERROR: RUN_DIR must not be empty" >&2;                       errors=1
+        echo "ERROR: RUN_DIR must not be empty" >&2;       errors=1
     fi
-
-    # Check MAX_LOG_SIZE is a positive integer
-    if ! expr "$MAX_LOG_SIZE" : '^[0-9][0-9]*$' > /dev/null 2>&1 || \
-       [ "$MAX_LOG_SIZE" -le 0 ]; then
+    if ! [[ "$MAX_LOG_SIZE" =~ ^[0-9]+$ ]] || [ "$MAX_LOG_SIZE" -le 0 ]; then
         echo "ERROR: MAX_LOG_SIZE must be a positive integer, got: '${MAX_LOG_SIZE}'" >&2
         errors=1
     fi
@@ -112,14 +95,17 @@ validate_config() {
     fi
 }
 
-# init_paths
-# Sets path variables that depend on RUN_DIR.
+
+# =============================================================================
+# RUNTIME PATHS — derived from RUN_DIR (set after config is loaded)
+# =============================================================================
+
+# init_paths sets path variables that depend on RUN_DIR.
 # Called after load_config so RUN_DIR is guaranteed to be set.
 init_paths() {
-    LOCK_DIR="${RUN_DIR}/target_job.lock"
+    LOCK_FILE="${RUN_DIR}/target_job.lock"
     STATE_FILE="${RUN_DIR}/target_job_success.log"
     LOG_FILE="${RUN_DIR}/target_job.log"
-    DATES_FILE="/tmp/target_job_dates_$$"
 }
 
 
@@ -132,10 +118,11 @@ init_paths() {
 # Only called when the job is actually going to run — silent exits produce
 # no log output, avoiding noise from the every-minute cron.
 log() {
-    level="$1"
-    message="$2"
+    local level="$1"
+    local message="$2"
+    local timestamp
     timestamp=$(date +"%Y-%m-%d %H:%M:%S")
-    line="[$timestamp] [$level] $message"
+    local line="[$timestamp] [$level] $message"
     echo "$line"
     echo "$line" >> "$LOG_FILE"
 }
@@ -144,7 +131,8 @@ log() {
 # Rotates LOG_FILE to LOG_FILE.1 if it exceeds MAX_LOG_SIZE bytes.
 rotate_log_if_needed() {
     if [ -f "$LOG_FILE" ]; then
-        size=$(wc -c < "$LOG_FILE" | awk '{print $1}')
+        local size
+        size=$(wc -c < "$LOG_FILE")
         if [ "$size" -gt "$MAX_LOG_SIZE" ]; then
             mv "$LOG_FILE" "${LOG_FILE}.1"
             log "INFO" "Log rotated (exceeded ${MAX_LOG_SIZE} bytes)"
@@ -156,75 +144,18 @@ rotate_log_if_needed() {
 # =============================================================================
 # LOCK — ensures only one instance runs at a time
 # =============================================================================
-# mkdir is atomic on all POSIX-compliant filesystems. The EXIT trap releases it.
+# Uses flock on a file descriptor — lock is released automatically on exit,
+# even on crashes. No stale lock cleanup needed.
 
 # acquire_lock
-# Creates LOCK_DIR atomically. Returns 0 if acquired, 1 if already locked.
+# Opens fd 9 on LOCK_FILE and applies an exclusive non-blocking flock.
+# Exits silently if the lock is already held by another instance.
 acquire_lock() {
-    if mkdir "$LOCK_DIR" 2>/dev/null; then
-        echo $$ > "${LOCK_DIR}/pid"
-        return 0
+    exec 9>"$LOCK_FILE"
+    if ! flock --nonblock 9; then
+        exit 0  # another instance is running — silent exit
     fi
-    return 1
-}
-
-# release_lock
-# Removes the lock directory. Called via the EXIT trap.
-release_lock() {
-    rm -rf "$LOCK_DIR"
-}
-
-
-# =============================================================================
-# DATE ARITHMETIC — pure sh, no date -d required
-# =============================================================================
-# Uses Julian Day Numbers (JDN) for portable date arithmetic.
-# Valid for all Gregorian calendar dates (1583+).
-
-# date_to_jdn YEAR MONTH DAY → prints the Julian Day Number
-date_to_jdn() {
-    year="$1" month="$2" day="$3"
-    a=$(( (14 - month) / 12 ))
-    y=$(( year + 4800 - a ))
-    m=$(( month + 12 * a - 3 ))
-    echo $(( day + (153*m + 2)/5 + 365*y + y/4 - y/100 + y/400 - 32045 ))
-}
-
-# jdn_to_date JDN → prints YYYY-MM-DD
-jdn_to_date() {
-    jdn="$1"
-    a=$(( jdn + 32044 ))
-    b=$(( (4*a + 3) / 146097 ))
-    c=$(( a - (146097*b)/4 ))
-    d=$(( (4*c + 3) / 1461 ))
-    e=$(( c - (1461*d)/4 ))
-    m=$(( (5*e + 2) / 153 ))
-    day=$(( e - (153*m+2)/5 + 1 ))
-    month=$(( m + 3 - 12*(m/10) ))
-    year=$(( 100*b + d - 4800 + m/10 ))
-    printf "%04d-%02d-%02d\n" "$year" "$month" "$day"
-}
-
-# parse_date DATE_STR
-# Sets PARSED_YEAR, PARSED_MONTH, PARSED_DAY from a YYYY-MM-DD string.
-# Uses expr to strip leading zeros (avoids octal misinterpretation in $(())).
-parse_date() {
-    PARSED_YEAR=$(echo  "$1" | cut -d'-' -f1)
-    PARSED_MONTH=$(expr "$(echo "$1" | cut -d'-' -f2)" + 0)
-    PARSED_DAY=$(expr   "$(echo "$1" | cut -d'-' -f3)" + 0)
-}
-
-# date_to_jdn_str DATE_STR → convenience wrapper: parse then convert to JDN
-date_to_jdn_str() {
-    parse_date "$1"
-    date_to_jdn "$PARSED_YEAR" "$PARSED_MONTH" "$PARSED_DAY"
-}
-
-# subtract_days DATE_STR N → prints date N days before DATE_STR
-subtract_days() {
-    parse_date "$1"
-    jdn=$(date_to_jdn "$PARSED_YEAR" "$PARSED_MONTH" "$PARSED_DAY")
-    jdn_to_date $(( jdn - $2 ))
+    log "INFO" "Lock acquired (PID $$)"
 }
 
 
@@ -232,57 +163,61 @@ subtract_days() {
 # EASTER / TARGET CALENDAR LOGIC
 # =============================================================================
 
-# easter_sunday YEAR → prints YYYY-MM-DD
-# Uses the Meeus/Jones/Butcher algorithm. Valid for Gregorian years (1583+).
+# easter_sunday YEAR
+# Prints Easter Sunday as YYYY-MM-DD using the Meeus/Jones/Butcher algorithm.
+# Valid for all Gregorian calendar years (1583+).
 easter_sunday() {
-    Y="$1"
-    a=$(( Y % 19 ))
-    b=$(( Y / 100 ))
-    c=$(( Y % 100 ))
-    d=$(( b / 4 ))
-    e=$(( b % 4 ))
-    f=$(( (b + 8) / 25 ))
-    g=$(( (b - f + 1) / 3 ))
-    h=$(( (19*a + b - d - g + 15) % 30 ))
-    i=$(( c / 4 ))
-    k=$(( c % 4 ))
-    l=$(( (32 + 2*e + 2*i - h - k) % 7 ))
-    m=$(( (a + 11*h + 22*l) / 451 ))
-    month=$(( (h + l - 7*m + 114) / 31 ))
-    day=$(( (h + l - 7*m + 114) % 31 + 1 ))
-    printf "%04d-%02d-%02d\n" "$Y" "$month" "$day"
+    local Y=$1
+    local a=$((Y % 19))
+    local b=$((Y / 100))
+    local c=$((Y % 100))
+    local d=$((b / 4))
+    local e=$((b % 4))
+    local f=$(((b + 8) / 25))
+    local g=$(((b - f + 1) / 3))
+    local h=$(((19*a + b - d - g + 15) % 30))
+    local i=$((c / 4))
+    local k=$((c % 4))
+    local l=$(((32 + 2*e + 2*i - h - k) % 7))
+    local m=$(((a + 11*h + 22*l) / 451))
+    local month=$(((h + l - 7*m + 114) / 31))
+    local day=$(((h + l - 7*m + 114) % 31 + 1))
+    printf "%04d-%02d-%02d" "$Y" "$month" "$day"
 }
 
-# is_target_closing_day DATE_STR
-# Returns 0 (true) if closing, 1 (false) if open.
+# is_target_closing_day DATE (YYYY-MM-DD)
+# Returns 0 (true) if the date is a TARGET closing day, 1 (false) if open.
 # Closing days: Sat, Sun, Jan 1, May 1, Dec 25, Dec 26, Good Friday, Easter Monday.
 is_target_closing_day() {
-    parse_date "$1"
-    year="$PARSED_YEAR"
-    month="$PARSED_MONTH"
-    day="$PARSED_DAY"
+    local input_date="$1"
+    local year="${input_date:0:4}"
+    local month=$((10#${input_date:5:2}))
+    local day=$((10#${input_date:8:2}))
 
-    # Weekend: JDN % 7 gives 0=Mon ... 4=Fri, 5=Sat, 6=Sun
-    jdn=$(date_to_jdn "$year" "$month" "$day")
-    if [ $(( jdn % 7 )) -ge 5 ]; then
+    # Weekend (5=Saturday, 6=Sunday)
+    local weekday
+    weekday=$(date -d "$input_date" +%u)
+    if [ "$weekday" -ge 6 ]; then
         return 0
     fi
 
     # Fixed public holidays
-    if   { [ "$month" -eq 1  ] && [ "$day" -eq 1  ]; } \
-      || { [ "$month" -eq 5  ] && [ "$day" -eq 1  ]; } \
-      || { [ "$month" -eq 12 ] && [ "$day" -eq 25 ]; } \
-      || { [ "$month" -eq 12 ] && [ "$day" -eq 26 ]; }; then
+    if { [ "$month" -eq 1  ] && [ "$day" -eq 1  ]; } ||
+       { [ "$month" -eq 5  ] && [ "$day" -eq 1  ]; } ||
+       { [ "$month" -eq 12 ] && [ "$day" -eq 25 ]; } ||
+       { [ "$month" -eq 12 ] && [ "$day" -eq 26 ]; }; then
         return 0
     fi
 
     # Moving holidays
+    local easter
     easter=$(easter_sunday "$year")
-    easter_jdn=$(date_to_jdn_str "$easter")
-    good_friday=$(jdn_to_date  $(( easter_jdn - 2 )))
-    easter_monday=$(jdn_to_date $(( easter_jdn + 1 )))
+    local good_friday
+    good_friday=$(date -d "$easter - 2 days" +%Y-%m-%d)
+    local easter_monday
+    easter_monday=$(date -d "$easter + 1 day" +%Y-%m-%d)
 
-    if [ "$1" = "$good_friday" ] || [ "$1" = "$easter_monday" ]; then
+    if [ "$input_date" = "$good_friday" ] || [ "$input_date" = "$easter_monday" ]; then
         return 0
     fi
 
@@ -302,14 +237,14 @@ get_last_success_date() {
     if [ -f "$STATE_FILE" ] && [ -s "$STATE_FILE" ]; then
         tail -1 "$STATE_FILE" | cut -d' ' -f1
     else
-        subtract_days "$ANCHOR_DATE" 1
+        date -d "$ANCHOR_DATE - 1 day" +%Y-%m-%d
     fi
 }
 
 # has_run_successfully_today DATE
 # Returns 0 if DATE appears in STATE_FILE, 1 otherwise.
 has_run_successfully_today() {
-    if [ -f "$STATE_FILE" ] && grep -F "$1" "$STATE_FILE" > /dev/null 2>&1; then
+    if [ -f "$STATE_FILE" ] && grep -qF "$1" "$STATE_FILE"; then
         return 0
     fi
     return 1
@@ -318,6 +253,7 @@ has_run_successfully_today() {
 # record_success DATE
 # Appends DATE with an execution timestamp to STATE_FILE.
 record_success() {
+    local timestamp
     timestamp=$(date +"%Y-%m-%d %H:%M:%S")
     echo "$1  executed_at=$timestamp" >> "$STATE_FILE"
 }
@@ -328,20 +264,19 @@ record_success() {
 # =============================================================================
 
 # get_report_dates TODAY_DATE
-# Writes to DATES_FILE every calendar date from (last_success + 1 day)
-# up to and including TODAY_DATE, in chronological order (one date per line).
+# Prints every calendar date from (last_success + 1 day) up to and including
+# TODAY_DATE, in chronological order (one date per line).
 get_report_dates() {
-    today="$1"
+    local today="$1"
+    local last_success
     last_success=$(get_last_success_date)
 
-    start_jdn=$(( $(date_to_jdn_str "$last_success") + 1 ))
-    end_jdn=$(date_to_jdn_str "$today")
+    local current
+    current=$(date -d "$last_success + 1 day" +%Y-%m-%d)
 
-    rm -f "$DATES_FILE"
-    current_jdn="$start_jdn"
-    while [ "$current_jdn" -le "$end_jdn" ]; do
-        jdn_to_date "$current_jdn" >> "$DATES_FILE"
-        current_jdn=$(( current_jdn + 1 ))
+    while [[ ! "$current" > "$today" ]]; do
+        echo "$current"
+        current=$(date -d "$current + 1 day" +%Y-%m-%d)
     done
 }
 
@@ -351,8 +286,9 @@ get_report_dates() {
 # =============================================================================
 
 cleanup() {
-    release_lock
-    rm -f "$DATES_FILE"
+    # flock releases automatically when fd 9 is closed on exit.
+    # Nothing extra needed — included for future extensibility.
+    :
 }
 
 
@@ -369,15 +305,17 @@ main() {
     validate_config
     init_paths
 
+    local now
+    now=$(date +%H%M)
+    local trigger
+    trigger=$(printf "%02d%02d" "$TRIGGER_HOUR" "$TRIGGER_MINUTE")
+    local today
     today=$(date +%Y-%m-%d)
 
     # ------------------------------------------------------------------
     # GATE 1 — Time check (silent exit before trigger time)
-    # HHMM as a 4-digit integer compares correctly (e.g. 1930 > 0800).
     # ------------------------------------------------------------------
-    current_hhmm=$(date +%H%M)
-    trigger_hhmm=$(printf "%02d%02d" "$TRIGGER_HOUR" "$TRIGGER_MINUTE")
-    if [ "$current_hhmm" -lt "$trigger_hhmm" ]; then
+    if [ "$now" -lt "$trigger" ]; then
         exit 0
     fi
 
@@ -398,61 +336,47 @@ main() {
     # ------------------------------------------------------------------
     # GATE 4 — Acquire lock (silent exit if another instance is running)
     # ------------------------------------------------------------------
-    if ! acquire_lock; then
-        exit 0
-    fi
     trap cleanup EXIT INT TERM HUP
-
-    # ------------------------------------------------------------------
-    # Initialise logging — only reached when we are actually going to run
-    # ------------------------------------------------------------------
     mkdir -p "$RUN_DIR"
-    rotate_log_if_needed
+    acquire_lock
 
-    log "INFO" "========== target_job_sh.sh started (PID $$) =========="
+    rotate_log_if_needed
+    log "INFO" "========== target_job_bash.sh started (PID $$) =========="
     log "INFO" "Config : $CONFIG_FILE"
     log "INFO" "Today  : $today | Trigger reached: $(date +%H:%M)"
 
     # ------------------------------------------------------------------
     # BUILD DATE RANGE
     # ------------------------------------------------------------------
+    local last_success
     last_success=$(get_last_success_date)
     log "INFO" "Last success: $last_success | Anchor: $ANCHOR_DATE"
 
-    get_report_dates "$today"
-
-    count=$(wc -l < "$DATES_FILE" | awk '{print $1}')
-    log "INFO" "Date range to process ($count day(s)):"
+    # Load dates into an array then into positional params for the job call
+    local dates=()
     while IFS= read -r d; do
+        dates+=("$d")
         log "INFO" "  -> $d"
-    done < "$DATES_FILE"
+    done < <(get_report_dates "$today")
 
-    # ------------------------------------------------------------------
-    # LOAD DATES INTO POSITIONAL PARAMETERS ($@)
-    # POSIX substitute for arrays: set -- clears $@, then we append
-    # each date one by one. After the loop "$@" holds all dates.
-    # ------------------------------------------------------------------
-    set --
-    while IFS= read -r d; do
-        set -- "$@" "$d"
-    done < "$DATES_FILE"
+    log "INFO" "Date range: ${#dates[@]} day(s)"
 
     # ------------------------------------------------------------------
     # EXECUTE JOB
     # ------------------------------------------------------------------
-    log "INFO" "Running: $JOB_COMMAND $*"
-    if "$JOB_COMMAND" "$@"; then
+    log "INFO" "Running: $JOB_COMMAND ${dates[*]}"
+    if "$JOB_COMMAND" "${dates[@]}"; then
         log "INFO" "Job completed successfully (exit code 0)."
         record_success "$today"
         log "INFO" "Recorded success for $today → $STATE_FILE"
     else
-        exit_code=$?
+        local exit_code=$?
         log "ERROR" "Job FAILED with exit code $exit_code."
         log "ERROR" "Will retry on next cron trigger (every minute after ${TRIGGER_HOUR}:${TRIGGER_MINUTE})."
         exit "$exit_code"
     fi
 
-    log "INFO" "========== target_job_sh.sh finished =========="
+    log "INFO" "========== target_job_bash.sh finished =========="
 }
 
 main "$@"
