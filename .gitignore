@@ -1,0 +1,16 @@
+# Local Pages renderer output (produced by .github/scripts/render_site.py)
+site/
+
+# Release staging and built binaries
+dist/
+staging/
+artifacts/
+
+# Go module file created on-the-fly during CI
+src/go/go.mod
+src/go/go.sum
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp

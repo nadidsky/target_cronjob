@@ -77,16 +77,17 @@ validate_config() {
         echo "ERROR: JOB_COMMAND must not be empty" >&2;                  errors=1
     fi
 
-    # Check TRIGGER_HOUR is a number in 0-23
-    if ! expr "$TRIGGER_HOUR" : '^[0-9][0-9]*$' > /dev/null 2>&1 || \
-       [ "$TRIGGER_HOUR" -lt 0 ] || [ "$TRIGGER_HOUR" -gt 23 ]; then
-        echo "ERROR: TRIGGER_HOUR must be 0-23, got: '${TRIGGER_HOUR}'" >&2; errors=1
+    # Check CRON_SCHEDULE has exactly 5 space-separated fields (min hr dom mon dow)
+    _v_nf=$(echo "$CRON_SCHEDULE" | awk '{print NF}')
+    if [ "$_v_nf" -ne 5 ]; then
+        echo "ERROR: CRON_SCHEDULE must have 5 fields (min hr dom mon dow), got ${_v_nf}: '${CRON_SCHEDULE}'" >&2
+        errors=1
     fi
 
-    # Check TRIGGER_MINUTE is a number in 0-59
-    if ! expr "$TRIGGER_MINUTE" : '^[0-9][0-9]*$' > /dev/null 2>&1 || \
-       [ "$TRIGGER_MINUTE" -lt 0 ] || [ "$TRIGGER_MINUTE" -gt 59 ]; then
-        echo "ERROR: TRIGGER_MINUTE must be 0-59, got: '${TRIGGER_MINUTE}'" >&2; errors=1
+    # Check CRON_TOLERANCE is a non-negative integer
+    if ! expr "$CRON_TOLERANCE" : '^[0-9][0-9]*$' > /dev/null 2>&1; then
+        echo "ERROR: CRON_TOLERANCE must be a non-negative integer (minutes), got: '${CRON_TOLERANCE}'" >&2
+        errors=1
     fi
 
     # Check ANCHOR_DATE matches YYYY-MM-DD pattern
@@ -357,6 +358,137 @@ cleanup() {
 
 
 # =============================================================================
+# CRON SCHEDULE EVALUATION
+# =============================================================================
+# Implements a 5-field cron expression evaluator used by the time gate.
+# Format (identical to vixie-cron):  MINUTE  HOUR  DOM  MONTH  DOW
+#   *        any value
+#   n        exact integer
+#   n-m      inclusive range
+#   */n      every n-th step starting from 0  (e.g. */15 → 0,15,30,45)
+#   a,b,...  comma-separated list of the above (no spaces)
+# NOTE: range-step combinations like 5-30/5 are not supported; use comma lists.
+# DOW convention follows standard cron: 0=Sun, 1=Mon, …, 6=Sat (7=Sun alias).
+
+# cron_field_matches FIELD VALUE
+# Returns 0 if the integer VALUE matches the cron FIELD expression, 1 otherwise.
+# VALUE must be a non-negative decimal integer (no leading zeros).
+cron_field_matches() {
+    _cf_field="$1"
+    _cf_value="$2"
+
+    [ "$_cf_field" = "*" ] && return 0        # wildcard always matches
+
+    # Iterate comma-separated parts (pure POSIX, no subshell)
+    _cf_remain="${_cf_field},"
+    while [ -n "$_cf_remain" ]; do
+        _cf_part="${_cf_remain%%,*}"
+        _cf_remain="${_cf_remain#*,}"
+
+        case "$_cf_part" in
+            \*/*)
+                # Step: */n — matches when value % n == 0
+                _cf_n="${_cf_part#*/}"
+                [ $(( _cf_value % _cf_n )) -eq 0 ] && return 0
+                ;;
+            *-*)
+                # Range: lo-hi inclusive
+                _cf_lo="${_cf_part%-*}"
+                _cf_hi="${_cf_part#*-}"
+                if [ "$_cf_value" -ge "$_cf_lo" ] && \
+                   [ "$_cf_value" -le "$_cf_hi" ]; then return 0; fi
+                ;;
+            *)
+                # Exact value
+                [ "$_cf_value" -eq "$_cf_part" ] 2>/dev/null && return 0
+                ;;
+        esac
+    done
+    return 1
+}
+
+# is_in_cron_window
+# Returns 0 if "now" falls within a CRON_SCHEDULE trigger window.
+# A trigger window is the interval [T, T + CRON_TOLERANCE] where T is any
+# past scheduled time that matches today's date fields (dom/month/dow).
+#
+# Supports test-time overrides via environment variables (all optional):
+#   _TEST_NOW_HOUR   _TEST_NOW_MIN   — current hour (0-23) and minute (0-59)
+#   _TEST_NOW_DOM    _TEST_NOW_MON   — day-of-month (1-31) and month (1-12)
+#   _TEST_NOW_DOW                   — day-of-week cron-style (0=Sun..6=Sat)
+is_in_cron_window() {
+    # --- Parse the 5 cron fields ---
+    _cw_min_f=$(echo "$CRON_SCHEDULE" | awk '{print $1}')
+    _cw_hr_f=$( echo "$CRON_SCHEDULE" | awk '{print $2}')
+    _cw_dom_f=$(echo "$CRON_SCHEDULE" | awk '{print $3}')
+    _cw_mon_f=$(echo "$CRON_SCHEDULE" | awk '{print $4}')
+    _cw_dow_f=$(echo "$CRON_SCHEDULE" | awk '{print $5}')
+
+    # --- Current time/date (test-override-aware; strip leading zeros) ---
+    if [ -n "$_TEST_NOW_MIN" ];  then _cw_cur_min="$_TEST_NOW_MIN"
+    else _cw_cur_min=$(expr "$(date +%M)" + 0); fi
+
+    if [ -n "$_TEST_NOW_HOUR" ]; then _cw_cur_hr="$_TEST_NOW_HOUR"
+    else _cw_cur_hr=$(expr "$(date +%H)" + 0); fi
+
+    if [ -n "$_TEST_NOW_DOM" ];  then _cw_cur_dom="$_TEST_NOW_DOM"
+    else _cw_cur_dom=$(expr "$(date +%d)" + 0); fi
+
+    if [ -n "$_TEST_NOW_MON" ];  then _cw_cur_mon="$_TEST_NOW_MON"
+    else _cw_cur_mon=$(expr "$(date +%m)" + 0); fi
+
+    # Convert ISO weekday (%u: 1=Mon..7=Sun) to cron (0=Sun..6=Sat)
+    if [ -n "$_TEST_NOW_DOW" ]; then
+        _cw_cur_dow="$_TEST_NOW_DOW"          # already cron-style
+        _cw_cur_dow_alt=$(( (_cw_cur_dow == 0) ? 7 : _cw_cur_dow ))
+    else
+        _cw_iso=$(date +%u)
+        if [ "$_cw_iso" -eq 7 ]; then _cw_cur_dow=0; else _cw_cur_dow="$_cw_iso"; fi
+        _cw_cur_dow_alt="$_cw_iso"            # ISO form (7=Sun) for aliases
+    fi
+
+    # --- Month gate ---
+    cron_field_matches "$_cw_mon_f" "$_cw_cur_mon" || return 1
+
+    # --- DOM / DOW gate (cron OR-when-both-restricted semantics) ---
+    if [ "$_cw_dom_f" = "*" ] && [ "$_cw_dow_f" = "*" ]; then
+        :  # both wildcards — always passes
+    elif [ "$_cw_dom_f" = "*" ]; then
+        cron_field_matches "$_cw_dow_f" "$_cw_cur_dow" || \
+        cron_field_matches "$_cw_dow_f" "$_cw_cur_dow_alt" || return 1
+    elif [ "$_cw_dow_f" = "*" ]; then
+        cron_field_matches "$_cw_dom_f" "$_cw_cur_dom" || return 1
+    else
+        # Both restricted: OR logic
+        _cw_dom_ok=1; _cw_dow_ok=1
+        cron_field_matches "$_cw_dom_f" "$_cw_cur_dom"     && _cw_dom_ok=0
+        cron_field_matches "$_cw_dow_f" "$_cw_cur_dow"     && _cw_dow_ok=0
+        cron_field_matches "$_cw_dow_f" "$_cw_cur_dow_alt" && _cw_dow_ok=0
+        if [ "$_cw_dom_ok" -ne 0 ] && [ "$_cw_dow_ok" -ne 0 ]; then return 1; fi
+    fi
+
+    # --- Time-window gate ---
+    # Walk back from "now" up to CRON_TOLERANCE minutes; if any past minute
+    # matched the hour+minute fields we are inside a valid trigger window.
+    _cw_cur_total=$(( _cw_cur_hr * 60 + _cw_cur_min ))
+    _cw_win_start=$(( _cw_cur_total - CRON_TOLERANCE ))
+    [ "$_cw_win_start" -lt 0 ] && _cw_win_start=0
+
+    _cw_t="$_cw_win_start"
+    while [ "$_cw_t" -le "$_cw_cur_total" ]; do
+        _cw_t_hr=$(( _cw_t / 60 ))
+        _cw_t_min=$(( _cw_t % 60 ))
+        if cron_field_matches "$_cw_hr_f"  "$_cw_t_hr" && \
+           cron_field_matches "$_cw_min_f" "$_cw_t_min"; then
+            return 0
+        fi
+        _cw_t=$(( _cw_t + 1 ))
+    done
+    return 1
+}
+
+
+# =============================================================================
 # MAIN
 # =============================================================================
 
@@ -372,12 +504,11 @@ main() {
     today=$(date +%Y-%m-%d)
 
     # ------------------------------------------------------------------
-    # GATE 1 — Time check (silent exit before trigger time)
-    # HHMM as a 4-digit integer compares correctly (e.g. 1930 > 0800).
+    # GATE 1 — Cron window check (silent exit outside schedule window)
+    # Passes when now is within CRON_TOLERANCE minutes of a matching
+    # CRON_SCHEDULE time and today satisfies the dom/month/dow fields.
     # ------------------------------------------------------------------
-    current_hhmm=$(date +%H%M)
-    trigger_hhmm=$(printf "%02d%02d" "$TRIGGER_HOUR" "$TRIGGER_MINUTE")
-    if [ "$current_hhmm" -lt "$trigger_hhmm" ]; then
+    if ! is_in_cron_window; then
         exit 0
     fi
 
@@ -411,7 +542,7 @@ main() {
 
     log "INFO" "========== target_job_sh.sh started (PID $$) =========="
     log "INFO" "Config : $CONFIG_FILE"
-    log "INFO" "Today  : $today | Trigger reached: $(date +%H:%M)"
+    log "INFO" "Today  : $today | Schedule: ${CRON_SCHEDULE} | Tol: ${CRON_TOLERANCE}m | At: $(date +%H:%M)"
 
     # ------------------------------------------------------------------
     # BUILD DATE RANGE
@@ -448,11 +579,14 @@ main() {
     else
         exit_code=$?
         log "ERROR" "Job FAILED with exit code $exit_code."
-        log "ERROR" "Will retry on next cron trigger (every minute after ${TRIGGER_HOUR}:${TRIGGER_MINUTE})."
+        log "ERROR" "Will retry on next cron tick matching: ${CRON_SCHEDULE} (tolerance: ${CRON_TOLERANCE}m)."
         exit "$exit_code"
     fi
 
     log "INFO" "========== target_job_sh.sh finished =========="
 }
 
-main "$@"
+# Run main only when executed directly; skip when sourced for unit testing.
+if [ -z "$_SOURCED_FOR_TESTING" ]; then
+    main "$@"
+fi

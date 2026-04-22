@@ -1,0 +1,153 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v0.1.0)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build-go:
+    name: Build Go — ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            ext: ''
+          - goos: linux
+            goarch: arm64
+            ext: ''
+          - goos: windows
+            goarch: amd64
+            ext: '.exe'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+
+      - name: Initialise module (stdlib-only, no go.mod committed)
+        working-directory: src/go
+        run: |
+          if [ ! -f go.mod ]; then
+            go mod init target_job
+          fi
+
+      - name: Build
+        working-directory: src/go
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '0'
+        run: |
+          mkdir -p ../../dist
+          BIN="target_job-${GOOS}-${GOARCH}${{ matrix.ext }}"
+          go build -trimpath -ldflags="-s -w" -o "../../dist/${BIN}" ./target_job.go
+          echo "Built ../../dist/${BIN}"
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*
+          if-no-files-found: error
+
+  package-shell:
+    name: Package shell scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF##*/}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build shell bundles
+        env:
+          VERSION: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          STAGE="staging/target_job-${VERSION}"
+          mkdir -p "${STAGE}/posix_sh" "${STAGE}/bash"
+
+          cp src/posix_sh/target_job.sh src/posix_sh/target.conf "${STAGE}/posix_sh/"
+          cp src/bash/target_job.sh     src/bash/target.conf     "${STAGE}/bash/"
+          cp README.md LICENSE CLAUDE.md "${STAGE}/" 2>/dev/null || true
+
+          chmod +x "${STAGE}/posix_sh/target_job.sh" "${STAGE}/bash/target_job.sh"
+
+          tar -czf "dist/target_job-${VERSION}-shell.tar.gz" -C staging "target_job-${VERSION}"
+          (cd staging && zip -rq "../dist/target_job-${VERSION}-shell.zip" "target_job-${VERSION}")
+
+          ls -la dist/
+
+      - name: Upload shell bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: shell-bundle
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: [build-go, package-shell]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Flatten and checksum
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find artifacts -type f -exec cp {} dist/ \;
+          cd dist
+          sha256sum * > SHA256SUMS.txt
+          echo "=== Release assets ==="
+          ls -la
+          echo "=== Checksums ==="
+          cat SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          body: |
+            ## Assets
+
+            **Go binaries** (stdlib only, statically linked, stripped):
+            - `target_job-linux-amd64` — Linux x86_64
+            - `target_job-linux-arm64` — Linux ARM64
+            - `target_job-windows-amd64.exe` — Windows x86_64
+
+            **Shell bundles** (POSIX sh + bash variants, with `target.conf`):
+            - `target_job-<version>-shell.tar.gz`
+            - `target_job-<version>-shell.zip`
+
+            **Integrity:** `SHA256SUMS.txt`
+
+            > Installation instructions live in the header comment of each script and in the Go source.
+            > See the syntax-highlighted sources at the project's GitHub Pages site.

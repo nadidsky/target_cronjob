@@ -32,6 +32,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -50,10 +51,15 @@ type Config struct {
 	// (oldest first): e.g. my_report_job 2025-04-18 2025-04-19 2025-04-22
 	JobCommand string `json:"job_command"`
 
-	// TriggerHour and TriggerMinute define the earliest time the job may
-	// run each day (24h format). Every cron tick before this is a silent exit.
-	TriggerHour   int `json:"trigger_hour"`
-	TriggerMinute int `json:"trigger_minute"`
+	// CronSchedule is a standard 5-field cron expression that defines when
+	// the job is permitted to run: MINUTE HOUR DOM MONTH DOW.
+	// Examples: "30 19 * * 1-5" (19:30 on weekdays)
+	//           "0 8,12,17 * * *" (08:00, 12:00 and 17:00 every day)
+	CronSchedule string `json:"cron_schedule"`
+
+	// CronToleranceMinutes defines how many minutes after a scheduled time
+	// the job may still run (catch-up window for missed cron ticks).
+	CronToleranceMinutes int `json:"cron_tolerance_minutes"`
 
 	// AnchorDate (YYYY-MM-DD) is the earliest date ever included in a run.
 	// On the first ever execution (empty state file) the date range starts here.
@@ -70,12 +76,12 @@ type Config struct {
 // Any field present in the JSON file overrides the corresponding default.
 func defaults() Config {
 	return Config{
-		JobCommand:    "/usr/local/bin/my_report_job",
-		TriggerHour:   19,
-		TriggerMinute: 30,
-		AnchorDate:    "2025-01-01",
-		RunDir:        "/var/lib/target_job",
-		MaxLogBytes:   10 * 1024 * 1024,
+		JobCommand:           "/usr/local/bin/my_report_job",
+		CronSchedule:         "30 19 * * 1-5",
+		CronToleranceMinutes: 15,
+		AnchorDate:           "2025-01-01",
+		RunDir:               "/var/lib/target_job",
+		MaxLogBytes:          10 * 1024 * 1024,
 	}
 }
 
@@ -107,11 +113,11 @@ func validateConfig(cfg Config) error {
 	if cfg.JobCommand == "" {
 		return fmt.Errorf("job_command must not be empty")
 	}
-	if cfg.TriggerHour < 0 || cfg.TriggerHour > 23 {
-		return fmt.Errorf("trigger_hour must be 0–23, got %d", cfg.TriggerHour)
+	if err := validateCronSchedule(cfg.CronSchedule); err != nil {
+		return fmt.Errorf("cron_schedule: %w", err)
 	}
-	if cfg.TriggerMinute < 0 || cfg.TriggerMinute > 59 {
-		return fmt.Errorf("trigger_minute must be 0–59, got %d", cfg.TriggerMinute)
+	if cfg.CronToleranceMinutes < 0 {
+		return fmt.Errorf("cron_tolerance_minutes must be >= 0, got %d", cfg.CronToleranceMinutes)
 	}
 	if _, err := time.Parse("2006-01-02", cfg.AnchorDate); err != nil {
 		return fmt.Errorf("anchor_date must be YYYY-MM-DD, got %q", cfg.AnchorDate)
@@ -125,6 +131,16 @@ func validateConfig(cfg Config) error {
 	return nil
 }
 
+// validateCronSchedule checks that schedule has exactly 5 whitespace-separated fields.
+func validateCronSchedule(schedule string) error {
+	fields := strings.Fields(schedule)
+	if len(fields) != 5 {
+		return fmt.Errorf("must have exactly 5 fields (min hr dom mon dow), got %d in %q",
+			len(fields), schedule)
+	}
+	return nil
+}
+
 // =============================================================================
 // RUNTIME PATHS — derived from cfg.RunDir
 // =============================================================================
@@ -132,6 +148,107 @@ func validateConfig(cfg Config) error {
 func lockDir(cfg Config) string   { return filepath.Join(cfg.RunDir, "target_job.lock") }
 func stateFile(cfg Config) string { return filepath.Join(cfg.RunDir, "target_job_success.log") }
 func logFile(cfg Config) string   { return filepath.Join(cfg.RunDir, "target_job.log") }
+
+// =============================================================================
+// CRON SCHEDULE EVALUATION
+// =============================================================================
+
+// matchesCronField reports whether value matches the given cron field expression.
+// Supported syntax: * | n | n-m | */n | a,b,... (no spaces within the field).
+// DOW convention: 0=Sun, 1=Mon, …, 6=Sat; 7 is accepted as a Sun alias.
+func matchesCronField(field string, value int) bool {
+	if field == "*" {
+		return true
+	}
+	for _, part := range strings.Split(field, ",") {
+		if strings.HasPrefix(part, "*/") {
+			n, err := strconv.Atoi(part[2:])
+			if err == nil && n > 0 && value%n == 0 {
+				return true
+			}
+		} else if strings.Contains(part, "-") {
+			bounds := strings.SplitN(part, "-", 2)
+			lo, e1 := strconv.Atoi(bounds[0])
+			hi, e2 := strconv.Atoi(bounds[1])
+			if e1 == nil && e2 == nil && value >= lo && value <= hi {
+				return true
+			}
+		} else {
+			n, err := strconv.Atoi(part)
+			if err == nil && n == value {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// isInCronWindow reports whether now falls inside a trigger window defined by
+// the 5-field cron schedule and a tolerance.
+// A trigger window is [T, T + toleranceMin] for every time T that matches the
+// schedule's minute+hour fields AND today satisfies the dom/month/dow fields.
+func isInCronWindow(now time.Time, schedule string, toleranceMin int) bool {
+	fields := strings.Fields(schedule)
+	if len(fields) != 5 {
+		return false
+	}
+	minF, hrF, domF, monF, dowF := fields[0], fields[1], fields[2], fields[3], fields[4]
+
+	curMin  := now.Minute()
+	curHr   := now.Hour()
+	curDom  := now.Day()
+	curMon  := int(now.Month())
+	// Go's Weekday(): Sun=0, Mon=1, …, Sat=6 — aligns with cron DOW.
+	curDow  := int(now.Weekday())
+
+	// Month gate
+	if !matchesCronField(monF, curMon) {
+		return false
+	}
+
+	// DOM / DOW gate (OR semantics when both are restricted)
+	domWild := domF == "*"
+	dowWild := dowF == "*"
+	switch {
+	case domWild && dowWild:
+		// always passes
+	case domWild:
+		dowOk := matchesCronField(dowF, curDow)
+		if curDow == 0 {
+			dowOk = dowOk || matchesCronField(dowF, 7) // 7=Sun alias
+		}
+		if !dowOk {
+			return false
+		}
+	case dowWild:
+		if !matchesCronField(domF, curDom) {
+			return false
+		}
+	default:
+		domOk := matchesCronField(domF, curDom)
+		dowOk := matchesCronField(dowF, curDow)
+		if curDow == 0 {
+			dowOk = dowOk || matchesCronField(dowF, 7)
+		}
+		if !domOk && !dowOk {
+			return false
+		}
+	}
+
+	// Time-window gate: look for any matching minute in [now-tolerance, now].
+	curTotal   := curHr*60 + curMin
+	winStart   := curTotal - toleranceMin
+	if winStart < 0 {
+		winStart = 0
+	}
+	for t := winStart; t <= curTotal; t++ {
+		tHr, tMin := t/60, t%60
+		if matchesCronField(hrF, tHr) && matchesCronField(minF, tMin) {
+			return true
+		}
+	}
+	return false
+}
 
 // =============================================================================
 // LOGGING
@@ -371,12 +488,9 @@ func main() {
 	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
 
 	// ------------------------------------------------------------------
-	// GATE 1 — Time check (silent exit before trigger time)
-	// Most cron ticks exit here in microseconds.
+	// GATE 1 — Cron window check (silent exit outside schedule window)
 	// ------------------------------------------------------------------
-	triggerReached := now.Hour() > cfg.TriggerHour ||
-		(now.Hour() == cfg.TriggerHour && now.Minute() >= cfg.TriggerMinute)
-	if !triggerReached {
+	if !isInCronWindow(now, cfg.CronSchedule, cfg.CronToleranceMinutes) {
 		os.Exit(0)
 	}
 
@@ -421,7 +535,8 @@ func main() {
 
 	logf("INFO", "========== target_job started (PID %d) ==========", os.Getpid())
 	logf("INFO", "Config     : %s", *configPath)
-	logf("INFO", "Today      : %s | Trigger time reached: %s", today.Format("2006-01-02"), now.Format("15:04"))
+	logf("INFO", "Today      : %s | Schedule: %s | Tol: %dm | At: %s",
+		today.Format("2006-01-02"), cfg.CronSchedule, cfg.CronToleranceMinutes, now.Format("15:04"))
 	logf("INFO", "Job command: %s", cfg.JobCommand)
 
 	// ------------------------------------------------------------------
@@ -447,8 +562,8 @@ func main() {
 
 	if err := runJob(cfg, dates); err != nil {
 		logf("ERROR", "Job FAILED: %v", err)
-		logf("ERROR", "Will retry on next cron trigger (every minute after %02d:%02d).",
-			cfg.TriggerHour, cfg.TriggerMinute)
+	logf("ERROR", "Will retry on next cron tick matching: %s (tolerance: %dm).",
+		cfg.CronSchedule, cfg.CronToleranceMinutes)
 		os.Exit(1)
 	}
 
