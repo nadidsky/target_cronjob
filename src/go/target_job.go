@@ -194,12 +194,12 @@ func isInCronWindow(now time.Time, schedule string, toleranceMin int) bool {
 	}
 	minF, hrF, domF, monF, dowF := fields[0], fields[1], fields[2], fields[3], fields[4]
 
-	curMin  := now.Minute()
-	curHr   := now.Hour()
-	curDom  := now.Day()
-	curMon  := int(now.Month())
+	curMin := now.Minute()
+	curHr := now.Hour()
+	curDom := now.Day()
+	curMon := int(now.Month())
 	// Go's Weekday(): Sun=0, Mon=1, …, Sat=6 — aligns with cron DOW.
-	curDow  := int(now.Weekday())
+	curDow := int(now.Weekday())
 
 	// Month gate
 	if !matchesCronField(monF, curMon) {
@@ -236,8 +236,8 @@ func isInCronWindow(now time.Time, schedule string, toleranceMin int) bool {
 	}
 
 	// Time-window gate: look for any matching minute in [now-tolerance, now].
-	curTotal   := curHr*60 + curMin
-	winStart   := curTotal - toleranceMin
+	curTotal := curHr*60 + curMin
+	winStart := curTotal - toleranceMin
 	if winStart < 0 {
 		winStart = 0
 	}
@@ -349,10 +349,10 @@ func isTargetClosingDay(d time.Time) bool {
 	}
 
 	switch {
-	case d.Month() == time.January  && d.Day() == 1,
-		 d.Month() == time.May       && d.Day() == 1,
-		 d.Month() == time.December  && d.Day() == 25,
-		 d.Month() == time.December  && d.Day() == 26:
+	case d.Month() == time.January && d.Day() == 1,
+		d.Month() == time.May && d.Day() == 1,
+		d.Month() == time.December && d.Day() == 25,
+		d.Month() == time.December && d.Day() == 26:
 		return true
 	}
 
@@ -438,7 +438,7 @@ func recordSuccess(cfg Config, today time.Time) error {
 func getReportDates(cfg Config, today time.Time) []time.Time {
 	lastSuccess := getLastSuccessDate(cfg)
 	start := lastSuccess.AddDate(0, 0, 1)
-	end   := time.Date(today.Year(), today.Month(), today.Day(), 0, 0, 0, 0, time.UTC)
+	end := time.Date(today.Year(), today.Month(), today.Day(), 0, 0, 0, 0, time.UTC)
 
 	var dates []time.Time
 	for d := start; !d.After(end); d = d.AddDate(0, 0, 1) {
@@ -484,7 +484,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	now   := time.Now()
+	now := time.Now()
 	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
 
 	// ------------------------------------------------------------------
@@ -562,8 +562,8 @@ func main() {
 
 	if err := runJob(cfg, dates); err != nil {
 		logf("ERROR", "Job FAILED: %v", err)
-	logf("ERROR", "Will retry on next cron tick matching: %s (tolerance: %dm).",
-		cfg.CronSchedule, cfg.CronToleranceMinutes)
+		logf("ERROR", "Will retry on next cron tick matching: %s (tolerance: %dm).",
+			cfg.CronSchedule, cfg.CronToleranceMinutes)
 		os.Exit(1)
 	}
 
