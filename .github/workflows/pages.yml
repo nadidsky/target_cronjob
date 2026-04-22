@@ -48,6 +48,10 @@ jobs:
     name: Deploy to GitHub Pages
     needs: build
     runs-on: ubuntu-latest
+    # The 'github-pages' environment is auto-created when you enable GitHub Pages
+    # in repository Settings → Pages → Source: "GitHub Actions".
+    # The VS Code GitHub Actions extension may flag this as unknown until the
+    # environment exists in the repo; the workflow is correct as-is.
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}

@@ -7,15 +7,26 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag (e.g. v0.1.0)'
+        description: 'Release tag (e.g. v1.0.0)'
         required: true
 
 permissions:
   contents: write
 
 jobs:
+  # --------------------------------------------------------------------------
+  # Gate: all tests must pass before any artifact is built
+  # --------------------------------------------------------------------------
+  test:
+    name: Tests must pass
+    uses: ./.github/workflows/test.yml
+
+  # --------------------------------------------------------------------------
+  # Build Go binaries
+  # --------------------------------------------------------------------------
   build-go:
     name: Build Go — ${{ matrix.goos }}/${{ matrix.goarch }}
+    needs: test
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -37,7 +48,16 @@ jobs:
         with:
           go-version: 'stable'
 
-      - name: Initialise module (stdlib-only, no go.mod committed)
+      - name: Resolve version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF##*/}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Init module (stdlib-only, no go.mod committed)
         working-directory: src/go
         run: |
           if [ ! -f go.mod ]; then
@@ -50,10 +70,12 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: '0'
+          VERSION: ${{ steps.version.outputs.tag }}
         run: |
           mkdir -p ../../dist
           BIN="target_job-${GOOS}-${GOARCH}${{ matrix.ext }}"
-          go build -trimpath -ldflags="-s -w" -o "../../dist/${BIN}" ./target_job.go
+          go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" \
+            -o "../../dist/${BIN}" ./target_job.go
           echo "Built ../../dist/${BIN}"
 
       - name: Upload binary
@@ -65,6 +87,7 @@ jobs:
 
   package-shell:
     name: Package shell scripts
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -89,7 +112,7 @@ jobs:
 
           cp src/posix_sh/target_job.sh src/posix_sh/target.conf "${STAGE}/posix_sh/"
           cp src/bash/target_job.sh     src/bash/target.conf     "${STAGE}/bash/"
-          cp README.md LICENSE CLAUDE.md "${STAGE}/" 2>/dev/null || true
+          cp README.md LICENSE SCENARIOS.md "${STAGE}/" 2>/dev/null || true
 
           chmod +x "${STAGE}/posix_sh/target_job.sh" "${STAGE}/bash/target_job.sh"
 
@@ -117,37 +140,156 @@ jobs:
         with:
           path: artifacts
 
-      - name: Flatten and checksum
+      - name: Flatten, generate checksums, and stage assets
         run: |
           set -euo pipefail
           mkdir -p dist
           find artifacts -type f -exec cp {} dist/ \;
           cd dist
-          sha256sum * > SHA256SUMS.txt
+
+          # SHA-256
+          sha256sum * | sort > SHA256SUMS.txt
+
+          # MD5 (informational)
+          md5sum * | sort > MD5SUMS.txt
+
+          # Combined human-readable manifest
+          {
+            printf '# target_job %s — file integrity manifest\n' "${GITHUB_REF##*/}"
+            printf '# Generated: %s UTC\n\n' "$(date -u '+%Y-%m-%d %H:%M:%S')"
+            printf '## SHA-256\n'
+            cat SHA256SUMS.txt
+            printf '\n## MD5\n'
+            cat MD5SUMS.txt
+          } > CHECKSUMS.txt
+
           echo "=== Release assets ==="
-          ls -la
-          echo "=== Checksums ==="
+          ls -lh
+          echo "=== SHA-256 ==="
           cat SHA256SUMS.txt
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.version.outputs.tag }}
           files: dist/*
           generate_release_notes: true
           fail_on_unmatched_files: true
           body: |
             ## Assets
 
-            **Go binaries** (stdlib only, statically linked, stripped):
-            - `target_job-linux-amd64` — Linux x86_64
-            - `target_job-linux-arm64` — Linux ARM64
-            - `target_job-windows-amd64.exe` — Windows x86_64
+            ### Go binaries — stdlib-only, statically linked, stripped
 
-            **Shell bundles** (POSIX sh + bash variants, with `target.conf`):
-            - `target_job-<version>-shell.tar.gz`
-            - `target_job-<version>-shell.zip`
+            | File | Platform |
+            |------|----------|
+            | `target_job-linux-amd64` | Linux x86-64 |
+            | `target_job-linux-arm64` | Linux ARM64 (Raspberry Pi 4/5, AWS Graviton) |
+            | `target_job-windows-amd64.exe` | Windows x86-64 |
 
-            **Integrity:** `SHA256SUMS.txt`
+            ### Shell bundles — POSIX sh + bash variants, with example `target.conf`
 
-            > Installation instructions live in the header comment of each script and in the Go source.
-            > See the syntax-highlighted sources at the project's GitHub Pages site.
+            | File | Format |
+            |------|--------|
+            | `target_job-${{ steps.version.outputs.tag }}-shell.tar.gz` | tar+gzip |
+            | `target_job-${{ steps.version.outputs.tag }}-shell.zip` | ZIP |
+
+            ### Integrity files
+
+            | File | Contents |
+            |------|----------|
+            | `SHA256SUMS.txt` | SHA-256 hash for every asset |
+            | `MD5SUMS.txt` | MD5 hash for every asset |
+            | `CHECKSUMS.txt` | Combined manifest (SHA-256 + MD5) |
+
+            **Verify a download:**
+            ```sh
+            sha256sum -c <(grep target_job-linux-amd64 SHA256SUMS.txt)
+            ```
+
+            ---
+
+            ## Quick start
+
+            ### Go binary (Linux amd64)
+            ```sh
+            # Download and install
+            curl -fsSL https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.tag }}/target_job-linux-amd64 \
+                 -o /usr/local/bin/target_job
+            chmod +x /usr/local/bin/target_job
+
+            # Verify
+            curl -fsSL https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.tag }}/SHA256SUMS.txt \
+                 | grep target_job-linux-amd64 | sha256sum -c
+
+            # Create config directory and download the example config
+            sudo mkdir -p /etc/target_job /var/lib/target_job
+            # Edit /etc/target_job/config.json (see Configuration section below)
+
+            # Add to crontab (every minute; the binary self-gates via cron_schedule):
+            # * * * * * /usr/local/bin/target_job -config /etc/target_job/config.json
+            ```
+
+            ### Shell script — bash variant
+            ```sh
+            tar -xzf target_job-${{ steps.version.outputs.tag }}-shell.tar.gz
+            sudo cp target_job-${{ steps.version.outputs.tag }}/bash/target_job.sh \
+                     /usr/local/bin/target_job_bash.sh
+            sudo chmod +x /usr/local/bin/target_job_bash.sh
+            sudo mkdir -p /etc/target_job /var/lib/target_job
+            sudo cp target_job-${{ steps.version.outputs.tag }}/bash/target.conf \
+                     /etc/target_job/target_job.conf
+            # Edit the config, then:
+            # * * * * * /usr/local/bin/target_job_bash.sh -c /etc/target_job/target_job.conf
+            ```
+
+            ### Shell script — POSIX sh variant (dash, busybox, Solaris, HP-UX…)
+            ```sh
+            tar -xzf target_job-${{ steps.version.outputs.tag }}-shell.tar.gz
+            sudo cp target_job-${{ steps.version.outputs.tag }}/posix_sh/target_job.sh \
+                     /usr/local/bin/target_job_sh.sh
+            sudo chmod +x /usr/local/bin/target_job_sh.sh
+            sudo mkdir -p /etc/target_job /var/lib/target_job
+            sudo cp target_job-${{ steps.version.outputs.tag }}/posix_sh/target.conf \
+                     /etc/target_job/target_job.conf
+            # * * * * * /usr/local/bin/target_job_sh.sh -c /etc/target_job/target_job.conf
+            ```
+
+            ---
+
+            ## Configuration reference
+
+            | Shell key | JSON key | Type | Example | Description |
+            |-----------|----------|------|---------|-------------|
+            | `JOB_COMMAND` | `job_command` | string | `/usr/local/bin/report` | Command run with dates (oldest first) as arguments |
+            | `CRON_SCHEDULE` | `cron_schedule` | 5-field cron | `30 19 * * 1-5` | When the job may fire (weekdays at 19:30) |
+            | `CRON_TOLERANCE` | `cron_tolerance_minutes` | integer ≥ 0 | `15` | Catch-up window in minutes after the scheduled time |
+            | `ANCHOR_DATE` | `anchor_date` | YYYY-MM-DD | `2025-01-01` | Earliest date on first run (empty state file) |
+            | `RUN_DIR` | `run_dir` | path | `/var/lib/target_job` | Runtime dir for lock, state log, and execution log |
+            | `MAX_LOG_SIZE` | `max_log_bytes` | integer | `10485760` | Log rotation threshold in bytes |
+
+            **`CRON_SCHEDULE` supports:** `*`, exact values (`30`), ranges (`1-5`), steps (`*/15`),
+            and comma lists (`0,15,30,45`). DOW: 0=Sun, 1=Mon … 6=Sat (7=Sun alias).
+
+            **`CRON_TOLERANCE` example:**  
+            `CRON_SCHEDULE="30 19 * * *"` + `CRON_TOLERANCE=15` → the job fires any cron tick
+            between 19:30 and 19:45. If the cron daemon restarted at 19:43 the job still runs;
+            if it restarted at 19:46 the tick is silently skipped (caught up next open day).
+
+            ---
+
+            ## 4-gate execution model
+
+            The script runs every minute and exits silently on the first failing gate:
+
+            1. **Cron-window gate** — `now` outside `[T, T + CRON_TOLERANCE]` for every
+               matching scheduled time `T` today → silent exit.
+            2. **Calendar gate** — today is a TARGET closing day (Sat, Sun, Jan 1, May 1,
+               Dec 25, Dec 26, Good Friday, Easter Monday) → silent exit.
+            3. **State gate** — today already recorded in success log → silent exit.
+            4. **Lock gate** — another instance running → silent exit.
+
+            When all four pass, the script builds a date range from `(last_success + 1)` to
+            today inclusive (including any closing days in the gap) and passes all dates to
+            `JOB_COMMAND`. The downstream job is responsible for per-date business logic.
+
+            > Syntax-highlighted source files are browsable at the project’s GitHub Pages site.

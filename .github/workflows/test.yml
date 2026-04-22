@@ -1,0 +1,108 @@
+name: Test
+
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - '.github/workflows/test.yml'
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'tests/**'
+
+jobs:
+  # --------------------------------------------------------------------------
+  # Go unit tests
+  # --------------------------------------------------------------------------
+  test-go:
+    name: Go tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+
+      - name: Init module (stdlib-only, no go.mod committed)
+        working-directory: src/go
+        run: |
+          if [ ! -f go.mod ]; then
+            go mod init target_job
+          fi
+
+      - name: Run tests
+        working-directory: src/go
+        run: go test -v -count=1 ./...
+
+      - name: Build check — linux/amd64
+        working-directory: src/go
+        env:
+          GOOS: linux
+          GOARCH: amd64
+          CGO_ENABLED: '0'
+        run: go build -o /dev/null ./...
+
+      - name: Build check — windows/amd64
+        working-directory: src/go
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: '0'
+        run: go build -o /dev/null ./...
+
+  # --------------------------------------------------------------------------
+  # bash tests (bats, Ubuntu)
+  # --------------------------------------------------------------------------
+  test-bash:
+    name: bash tests (bats)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install bats-core
+        run: |
+          git clone --depth=1 https://github.com/bats-core/bats-core.git /tmp/bats-core
+          sudo /tmp/bats-core/install.sh /usr/local
+
+      - name: Run bash tests
+        run: bats --tap tests/bats/test_bash.bats
+
+  # --------------------------------------------------------------------------
+  # POSIX sh tests (bats, using dash)
+  # --------------------------------------------------------------------------
+  test-posix-sh:
+    name: POSIX sh tests (bats / dash)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ensure dash is available
+        run: which dash || sudo apt-get install -y dash
+
+      - name: Install bats-core
+        run: |
+          git clone --depth=1 https://github.com/bats-core/bats-core.git /tmp/bats-core
+          sudo /tmp/bats-core/install.sh /usr/local
+
+      - name: Run POSIX sh tests
+        # bats itself uses bash, but the sourced script runs under sh.
+        # _SOURCED_FOR_TESTING bypasses the `main` call.
+        run: bats --tap tests/bats/test_posix_sh.bats
+
+  # --------------------------------------------------------------------------
+  # Shell lint (shellcheck)
+  # --------------------------------------------------------------------------
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: shellcheck — bash variant
+        run: shellcheck --shell=bash src/bash/target_job.sh
+
+      - name: shellcheck — POSIX sh variant
+        run: shellcheck --shell=sh src/posix_sh/target_job.sh
